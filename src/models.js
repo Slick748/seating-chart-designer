@@ -111,6 +111,23 @@ export function formatName(first, last, mode = 'short', nameOrder = 'lastFirst')
 }
 
 // Build assigned set
+// Sort comparator: +1 guests sort right after their parent attendee
+export function attendeeSort(a, b) {
+  const lastCmp = a[0].toLowerCase().localeCompare(b[0].toLowerCase());
+  if (lastCmp !== 0) return lastCmp;
+  const aFirst = a[1].toLowerCase();
+  const bFirst = b[1].toLowerCase();
+  const aPlus = aFirst.startsWith('+1 of ');
+  const bPlus = bFirst.startsWith('+1 of ');
+  const aBase = aPlus ? aFirst.slice(6) : aFirst;
+  const bBase = bPlus ? bFirst.slice(6) : bFirst;
+  const baseCmp = aBase.localeCompare(bBase);
+  if (baseCmp !== 0) return baseCmp;
+  if (aPlus && !bPlus) return 1;
+  if (!aPlus && bPlus) return -1;
+  return 0;
+}
+
 export function buildAssignedSet(tables, blocks) {
   const assigned = new Set();
   tables.forEach(t => Object.values(t.assignments).forEach(v => assigned.add(v)));
@@ -128,7 +145,7 @@ export function parseCSV(text) {
       attendees.push([parts[0] || '', parts[1] || '']);
     }
   }
-  attendees.sort((a, b) => a[0].toLowerCase().localeCompare(b[0].toLowerCase()) || a[1].toLowerCase().localeCompare(b[1].toLowerCase()));
+  attendees.sort(attendeeSort);
   return attendees;
 }
 

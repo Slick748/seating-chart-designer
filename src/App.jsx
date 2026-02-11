@@ -3,7 +3,7 @@ import { drawCanvas, hitTest, seatHitTest, resizeHandleHitTest } from './canvasR
 import {
   createTable, createChairBlock, createVenueElement,
   getTableTotalSeats, getBlockTotalSeats, getTotalSeats,
-  getBlockDimensions, buildAssignedSet, parseCSV, formatName,
+  getBlockDimensions, buildAssignedSet, parseCSV, formatName, attendeeSort,
   serializeProject, deserializeProject, exportCSV,
   TABLE_COLORS, VENUE_DEFAULTS, COLOR_PALETTE,
 } from './models';
@@ -50,7 +50,7 @@ export default function App() {
   const [smartGuidesEnabled, setSmartGuidesEnabled] = useState(true);
   const [smartGuides, setSmartGuides] = useState([]);
   const [resizeCursor, setResizeCursor] = useState(null);
-  const [showSeatNumbers, setShowSeatNumbers] = useState(false);
+  const [showSeatNumbers, setShowSeatNumbers] = useState(true);
 
   // Floorplan background
   const [floorplanData, setFloorplanData] = useState(null); // base64 data URL
@@ -64,6 +64,7 @@ export default function App() {
   const dragRef = useRef({ startX: 0, startY: 0, entity: null, hasMoved: false });
   const [dragAttendee, setDragAttendee] = useState(null);
   const [dragGhostPos, setDragGhostPos] = useState(null);
+  const dragSourceRef = useRef(null); // { entityType, entityId, seatKey } when drag started from a seated position
 
   // Pan state
   const [panX, setPanX] = useState(0);
@@ -704,6 +705,9 @@ export default function App() {
       case 'chair_block':
         defaults = { name: '', rows: 3, cols: 4, spacing: 'normal', color: '#4A4A4A' };
         break;
+      case 'venue':
+        defaults = { name: '', widthFt: 10, heightFt: 10, color: '#D4AF37' };
+        break;
       default:
         defaults = { ...VENUE_DEFAULTS[entityType] };
     }
@@ -797,11 +801,53 @@ export default function App() {
   function confirmAddAttendee(params) {
     if (params.first || params.last) {
       const newList = [...attendees, [params.last, params.first]];
-      newList.sort((a, b) => a[0].toLowerCase().localeCompare(b[0].toLowerCase()) || a[1].toLowerCase().localeCompare(b[1].toLowerCase()));
+      newList.sort(attendeeSort);
       setAttendees(newList);
       setStatus(`Added: ${dn([params.last, params.first])}`);
     }
     setModal(null);
+  }
+
+  function addPlusOne(attIdx) {
+    const [last, first] = attendees[attIdx];
+    const plusFirst = `+1 of ${first}`;
+    const newAtt = [last, plusFirst];
+    const oldList = [...attendees];
+    const newList = [...oldList, newAtt];
+    newList.sort(attendeeSort);
+    // Build index mapping: oldIdx -> newIdx
+    const used = new Set();
+    const indexMap = {};
+    oldList.forEach((att, oldIdx) => {
+      const newIdx = newList.findIndex((n, ni) => !used.has(ni) && n[0] === att[0] && n[1] === att[1]);
+      indexMap[oldIdx] = newIdx;
+      used.add(newIdx);
+    });
+    // Remap table assignments
+    setTables(prev => prev.map(t => {
+      const newAssign = {};
+      Object.entries(t.assignments).forEach(([seat, oldIdx]) => {
+        if (indexMap[oldIdx] !== undefined) newAssign[seat] = indexMap[oldIdx];
+      });
+      return { ...t, assignments: newAssign };
+    }));
+    // Remap block assignments
+    setChairBlocks(prev => prev.map(b => {
+      const newAssign = {};
+      Object.entries(b.assignments).forEach(([seat, oldIdx]) => {
+        if (indexMap[oldIdx] !== undefined) newAssign[seat] = indexMap[oldIdx];
+      });
+      return { ...b, assignments: newAssign };
+    }));
+    // Remap disabled set
+    setDisabledAttendees(prev => {
+      const newSet = new Set();
+      prev.forEach(oldIdx => { if (indexMap[oldIdx] !== undefined) newSet.add(indexMap[oldIdx]); });
+      return newSet;
+    });
+    setAttendees(newList);
+    setSelectedAttendee(null);
+    setStatus(`Added +1 for ${first} ${last}`);
   }
 
   function toggleDisable(attIdx) {
@@ -902,15 +948,18 @@ export default function App() {
   }
 
   function moveSeatToSeat(srcType, srcId, srcKey, dstType, dstId, dstKey) {
-    saveUndo();
     if (srcType === dstType && srcId === dstId) {
       swapSeats(srcType, srcId, srcKey, dstKey);
       return;
     }
-    let attIdx = null;
+    // Read attIdx from current state BEFORE setState (React 18 batching defers updater execution)
+    const srcEntity = (srcType === 'table' ? tables : chairBlocks).find(e => e.id === srcId);
+    const attIdx = srcEntity?.assignments[srcKey];
+    if (attIdx === null || attIdx === undefined) return;
+
+    saveUndo();
     const srcUpdater = prev => prev.map(e => {
       if (e.id !== srcId) return e;
-      attIdx = e.assignments[srcKey];
       const newA = { ...e.assignments };
       delete newA[srcKey];
       return { ...e, assignments: newA };
@@ -918,7 +967,6 @@ export default function App() {
     if (srcType === 'table') setTables(srcUpdater);
     else setChairBlocks(srcUpdater);
 
-    if (attIdx === null || attIdx === undefined) return;
     const dstUpdater = prev => prev.map(e => {
       if (e.id !== dstId) return e;
       return { ...e, assignments: { ...e.assignments, [dstKey]: attIdx } };
@@ -1171,9 +1219,14 @@ export default function App() {
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
       const seatInfo = seatHitTest(x, y, canvasState);
+      const src = dragSourceRef.current;
       if (seatInfo && !(seatInfo.seatKey in seatInfo.entity.assignments)) {
-        assignAttendee(seatInfo.entityType, seatInfo.entity.id, seatInfo.seatKey, dragAttendee);
-      } else {
+        if (src) {
+          moveSeatToSeat(src.entityType, src.entityId, src.seatKey, seatInfo.entityType, seatInfo.entity.id, seatInfo.seatKey);
+        } else {
+          assignAttendee(seatInfo.entityType, seatInfo.entity.id, seatInfo.seatKey, dragAttendee);
+        }
+      } else if (!src) {
         const tableHit = hitTest(x, y, canvasState);
         if (tableHit && (tableHit[0] === 'table' || tableHit[0] === 'block')) {
           assignNextAvailable(tableHit[0], tableHit[1].id, dragAttendee);
@@ -1181,6 +1234,7 @@ export default function App() {
       }
       setDragAttendee(null);
       setDragGhostPos(null);
+      dragSourceRef.current = null;
       setDragging(false);
       return;
     }
@@ -1256,6 +1310,11 @@ export default function App() {
         setZoomLevel(newZoom);
         setPanX(newPanX);
         setPanY(newPanY);
+      } else {
+        // Plain scroll = pan canvas
+        const { panX: curPanX, panY: curPanY } = zoomParamsRef.current;
+        setPanX(curPanX - (e.deltaX || 0));
+        setPanY(curPanY - e.deltaY);
       }
     };
     el.addEventListener('wheel', handler, { passive: false });
@@ -1623,26 +1682,18 @@ export default function App() {
           )}
         </div>
         <div className="topbar-section" style={{ position: 'relative' }}>
-          <button className="btn btn-venue btn-sm" onClick={() => setMenuOpen(menuOpen === 'addVenue' ? null : 'addVenue')}>+ Venue ▾</button>
-          {menuOpen === 'addVenue' && (
-            <div className="menu-dropdown">
-              <button className="menu-item" onClick={() => addEntity('dance_floor')}>Dance Floor</button>
-              <button className="menu-item" onClick={() => addEntity('stage')}>Stage</button>
-              <button className="menu-item" onClick={() => addEntity('bar')}>Bar</button>
-              <button className="menu-item" onClick={() => addEntity('dj_booth')}>DJ Booth</button>
-              <button className="menu-item" onClick={() => addEntity('buffet')}>Buffet</button>
-            </div>
-          )}
+          <button className="btn btn-venue btn-sm" onClick={() => addEntity('venue')}>+ Venue</button>
         </div>
       </div>
 
       {/* MAIN LAYOUT */}
-      <div className="app-layout"
+      <div className={`app-layout ${dragAttendee !== null ? 'is-dragging' : ''}`}
         onMouseMove={e => {
           if (dragAttendee !== null || popupDragSeat) setDragGhostPos({ x: e.clientX, y: e.clientY });
         }}
         onMouseUp={() => {
           if (dragAttendee !== null) {
+            dragSourceRef.current = null;
             setDragAttendee(null);
             setDragGhostPos(null);
           }
@@ -1690,7 +1741,12 @@ export default function App() {
                         }}
                         onDragStart={e => e.preventDefault()}
                         title={isAssigned ? 'Assigned' : isDisabled ? 'Disabled' : 'Click to select, drag to seat'}>
-                        {nameOrder === 'firstLast' ? `${a.first}, ${a.last}` : `${a.last}, ${a.first}`}
+                        <span className="attendee-name">{nameOrder === 'firstLast' ? `${a.first}, ${a.last}` : `${a.last}, ${a.first}`}</span>
+                        {!isDisabled && !a.first.startsWith('+1 of') && (
+                          <button className="att-plus-one" title={`Add +1 for ${a.first}`}
+                            onMouseDown={e => { e.stopPropagation(); e.preventDefault(); }}
+                            onClick={e => { e.stopPropagation(); addPlusOne(a.idx); }}>+1</button>
+                        )}
                       </div>
                     );
                   })}
@@ -1758,6 +1814,17 @@ export default function App() {
                     setDragGhostPos(null);
                   }
                 }}
+                onAssignToSeat={(seatKey, attIdx) => {
+                  const src = dragSourceRef.current;
+                  if (src) {
+                    moveSeatToSeat(src.entityType, src.entityId, src.seatKey, selectedItem[0], selectedItem[1].id, seatKey);
+                  } else {
+                    assignAttendee(selectedItem[0], selectedItem[1].id, seatKey, attIdx);
+                  }
+                  dragSourceRef.current = null;
+                  setDragAttendee(null);
+                  setDragGhostPos(null);
+                }}
               />
             )}
           </div>
@@ -1783,20 +1850,60 @@ export default function App() {
               chairBlocks.forEach(b => all.add(`block_${b.id}`));
               setCollapsedCards(all);
             }}
-            onAssign={assignAttendee}
+            onAssign={(et, eid, sk, attIdx) => {
+              const src = dragSourceRef.current;
+              if (src) {
+                moveSeatToSeat(src.entityType, src.entityId, src.seatKey, et, eid, sk);
+              } else {
+                assignAttendee(et, eid, sk, attIdx);
+              }
+              dragSourceRef.current = null;
+              setDragAttendee(null);
+              setDragGhostPos(null);
+            }}
             onUnassign={unassignSeat}
             onRename={renameEntity}
             onChangeColor={changeEntityColor}
             onDelete={confirmDeleteEntity}
             dragAttendee={dragAttendee}
             onDropNextAvailable={(et, eid, attIdx) => {
-              assignNextAvailable(et, eid, attIdx);
+              const src = dragSourceRef.current;
+              if (src) {
+                saveUndo();
+                // unassign from source, then find next available on target
+                unassignSeat(src.entityType, src.entityId, src.seatKey);
+                const entity = et === 'table'
+                  ? tables.find(t => t.id === eid)
+                  : chairBlocks.find(b => b.id === eid);
+                if (entity) {
+                  let seatKeys = [];
+                  if (et === 'table') {
+                    const total = getTableTotalSeats(entity);
+                    for (let i = 0; i < total; i++) seatKeys.push(i);
+                  } else {
+                    for (let r = 0; r < entity.rows; r++)
+                      for (let c = 0; c < entity.cols; c++)
+                        seatKeys.push(`${r}-${c}`);
+                  }
+                  const openKey = seatKeys.find(k => !(k in entity.assignments));
+                  if (openKey !== undefined) forceAssignSeat(et, eid, openKey, attIdx);
+                }
+              } else {
+                assignNextAvailable(et, eid, attIdx);
+              }
+              dragSourceRef.current = null;
               setDragAttendee(null);
               setDragGhostPos(null);
             }}
             onSelect={(type, entity) => { setSelectedItem([type, entity]); setSelectedItems([]); }}
             selectedItem={selectedItem}
             nameOrder={nameOrder}
+            onSeatDragStart={(et, eid, sk, attIdx, e) => {
+              setDragAttendee(attIdx);
+              setDragGhostPos({ x: e.clientX, y: e.clientY });
+              dragSourceRef.current = { entityType: et, entityId: eid, seatKey: sk };
+            }}
+            dragSourceRef={dragSourceRef}
           />
         )}
       </div>
@@ -1853,7 +1960,7 @@ export default function App() {
 
 // === TABLE POPUP ===
 function TablePopup({ entity, entityType, attendees, disabledAttendees, assigned, dragAttendee, popupDragSeat, nameOrder,
-  onClose, onUnassign, onRename, onSeatDragStart, onSeatDrop, onDropNextAvailable }) {
+  onClose, onUnassign, onRename, onSeatDragStart, onSeatDrop, onDropNextAvailable, onAssignToSeat }) {
   const [dragOverSeat, setDragOverSeat] = useState(null);
   const [dragOverHeader, setDragOverHeader] = useState(false);
   const [editingName, setEditingName] = useState(false);
@@ -1927,8 +2034,7 @@ function TablePopup({ entity, entityType, attendees, disabledAttendees, assigned
               onMouseLeave={() => setDragOverSeat(null)}
               onMouseUp={() => {
                 if (dragAttendee !== null && !occ) {
-                  onSeatDrop && onSeatDrop(null, key);
-                  // Actually handled by parent via assignAttendee
+                  onAssignToSeat && onAssignToSeat(key, dragAttendee);
                 }
                 if (popupDragSeat && !occ) {
                   onSeatDrop(popupDragSeat.seatKey, key);
@@ -1965,7 +2071,8 @@ function TablePopup({ entity, entityType, attendees, disabledAttendees, assigned
 // === LIST VIEW ===
 function ListView({ tables, chairBlocks, attendees, assigned, disabledAttendees, selectedAttendee, search,
   collapsedCards, onSearchChange, onToggleCollapse, onExpandAll, onCollapseAll,
-  onAssign, onUnassign, onRename, onChangeColor, onDelete, dragAttendee, onDropNextAvailable, onSelect, selectedItem, nameOrder }) {
+  onAssign, onUnassign, onRename, onChangeColor, onDelete, dragAttendee, onDropNextAvailable, onSelect, selectedItem, nameOrder,
+  onSeatDragStart, dragSourceRef }) {
   const term = search.toLowerCase();
   const totalSeats = tables.reduce((s, t) => s + getTableTotalSeats(t), 0) + chairBlocks.reduce((s, b) => s + b.rows * b.cols, 0);
   const totalAssigned = assigned.size;
@@ -1990,7 +2097,7 @@ function ListView({ tables, chairBlocks, attendees, assigned, disabledAttendees,
             onAssign={onAssign} onUnassign={onUnassign}
             onRename={onRename} onChangeColor={onChangeColor} onDelete={onDelete}
             dragAttendee={dragAttendee} onDropNextAvailable={onDropNextAvailable}
-            onSelect={onSelect} isSelected={selectedItem?.[0] === 'table' && selectedItem?.[1]?.id === t.id} nameOrder={nameOrder} />
+            onSelect={onSelect} isSelected={selectedItem?.[0] === 'table' && selectedItem?.[1]?.id === t.id} nameOrder={nameOrder} onSeatDragStart={onSeatDragStart} dragSourceRef={dragSourceRef} />
         ))}
         {chairBlocks.filter(b => !term || (b.name || `Section ${b.id}`).toLowerCase().includes(term)).map(b => (
           <EntityCard key={`b${b.id}`} entity={b} entityType="block" attendees={attendees}
@@ -2000,7 +2107,7 @@ function ListView({ tables, chairBlocks, attendees, assigned, disabledAttendees,
             onAssign={onAssign} onUnassign={onUnassign}
             onRename={onRename} onChangeColor={onChangeColor} onDelete={onDelete}
             dragAttendee={dragAttendee} onDropNextAvailable={onDropNextAvailable}
-            onSelect={onSelect} isSelected={selectedItem?.[0] === 'block' && selectedItem?.[1]?.id === b.id} nameOrder={nameOrder} />
+            onSelect={onSelect} isSelected={selectedItem?.[0] === 'block' && selectedItem?.[1]?.id === b.id} nameOrder={nameOrder} onSeatDragStart={onSeatDragStart} dragSourceRef={dragSourceRef} />
         ))}
       </div>
       {!tables.length && !chairBlocks.length && (
@@ -2012,7 +2119,7 @@ function ListView({ tables, chairBlocks, attendees, assigned, disabledAttendees,
   );
 }
 
-function EntityCard({ entity, entityType, attendees, collapsed, onToggle, selectedAttendee, assigned, disabledAttendees, onAssign, onUnassign, onRename, onChangeColor, onDelete, dragAttendee, onDropNextAvailable, onSelect, isSelected, nameOrder }) {
+function EntityCard({ entity, entityType, attendees, collapsed, onToggle, selectedAttendee, assigned, disabledAttendees, onAssign, onUnassign, onRename, onChangeColor, onDelete, dragAttendee, onDropNextAvailable, onSelect, isSelected, nameOrder, onSeatDragStart, dragSourceRef }) {
   const total = getTotalSeats(entity);
   const filled = Object.keys(entity.assignments).length;
   const defaultName = `${entityType === 'table' ? 'Table' : 'Block'} ${entity.id}`;
@@ -2051,8 +2158,9 @@ function EntityCard({ entity, entityType, attendees, collapsed, onToggle, select
     <div className={`entity-card ${isDragOver ? 'drag-over' : ''} ${isSelected ? 'selected' : ''}`}
       onMouseEnter={() => { if (dragAttendee !== null) setIsDragOver(true); }}
       onMouseLeave={() => setIsDragOver(false)}
-      onMouseUp={() => {
+      onMouseUp={(e) => {
         if (dragAttendee !== null && isDragOver) {
+          e.stopPropagation();
           onDropNextAvailable(entityType, entity.id, dragAttendee);
           setIsDragOver(false);
         }
@@ -2092,7 +2200,7 @@ function EntityCard({ entity, entityType, attendees, collapsed, onToggle, select
               <SeatRow key={key} seatKey={key} seatIdx={idx} entity={entity} entityType={entityType}
                 attendees={attendees} selectedAttendee={selectedAttendee} assigned={assigned}
                 disabledAttendees={disabledAttendees} onAssign={onAssign} onUnassign={onUnassign}
-                dragAttendee={dragAttendee} nameOrder={nameOrder} />
+                dragAttendee={dragAttendee} nameOrder={nameOrder} onSeatDragStart={onSeatDragStart} dragSourceRef={dragSourceRef} />
             ))}
           </div>
         </div>
@@ -2101,7 +2209,7 @@ function EntityCard({ entity, entityType, attendees, collapsed, onToggle, select
   );
 }
 
-function SeatRow({ seatKey, seatIdx, entity, entityType, attendees, selectedAttendee, assigned, disabledAttendees, onAssign, onUnassign, dragAttendee, nameOrder }) {
+function SeatRow({ seatKey, seatIdx, entity, entityType, attendees, selectedAttendee, assigned, disabledAttendees, onAssign, onUnassign, dragAttendee, nameOrder, onSeatDragStart, dragSourceRef }) {
   const attIdx = entity.assignments[seatKey];
   const occ = attIdx !== undefined;
   const name = occ && attIdx < attendees.length
@@ -2111,10 +2219,12 @@ function SeatRow({ seatKey, seatIdx, entity, entityType, attendees, selectedAtte
 
   return (
     <div className={`seat-row ${isDragOver ? 'drag-over' : ''}`}
+      style={{ userSelect: dragAttendee !== null ? 'none' : undefined }}
       onMouseEnter={() => { if (dragAttendee !== null && !occ) setIsDragOver(true); }}
       onMouseLeave={() => setIsDragOver(false)}
-      onMouseUp={() => {
-        if (dragAttendee !== null && isDragOver && !occ) {
+      onMouseUp={(e) => {
+        if (dragAttendee !== null && !occ) {
+          e.stopPropagation();
           onAssign(entityType, entity.id, seatKey, dragAttendee);
           setIsDragOver(false);
         }
@@ -2123,6 +2233,12 @@ function SeatRow({ seatKey, seatIdx, entity, entityType, attendees, selectedAtte
         {seatIdx === 0 ? '★1' : `${seatIdx + 1}`}
       </span>
       <span className={`seat-name ${occ ? 'filled' : 'empty'}`}
+        onMouseDown={occ ? (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onSeatDragStart && onSeatDragStart(entityType, entity.id, seatKey, attIdx, e);
+        } : undefined}
+        onDragStart={e => e.preventDefault()}
         onClick={() => {
           if (!occ && selectedAttendee != null && !assigned.has(selectedAttendee) && !disabledAttendees.has(selectedAttendee)) {
             onAssign(entityType, entity.id, seatKey, selectedAttendee);
@@ -2232,7 +2348,9 @@ function Modal({ modal, onClose, onConfirmAdd, onConfirmEdit, onConfirmAddAttend
     );
   }
 
+  const isVenue = !['round_table', 'rect_table', 'chair_block'].includes(et) && !isAddAttendee && !isConfirm && !isExport;
   const title = isAddAttendee ? 'Add Attendee'
+    : isVenue ? `${isAdd ? 'Add' : 'Edit'} Venue Element`
     : `${isAdd ? 'Add' : 'Edit'} ${et?.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase())}`;
 
   return (
@@ -2253,7 +2371,7 @@ function Modal({ modal, onClose, onConfirmAdd, onConfirmEdit, onConfirmAddAttend
           </>
         ) : (
           <>
-            <div className="modal-field"><label>Name</label><input type="text" value={params.name} onChange={e => set('name', e.target.value)} /></div>
+            <div className="modal-field"><label>Name</label><input type="text" value={params.name} onChange={e => set('name', e.target.value)} placeholder={isVenue ? 'e.g. Bar, Dance Floor, Buffet, Stage' : ''} /></div>
 
             {(et === 'round_table') && (
               <>

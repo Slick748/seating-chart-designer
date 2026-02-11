@@ -99,6 +99,7 @@ input[type="color"] { width: 30px; height: 26px; padding: 1px; cursor: pointer; 
 
 /* Layout */
 .app-layout { display: flex; flex: 1; overflow: hidden; }
+.app-layout.is-dragging { user-select: none; cursor: grabbing; }
 
 /* Left panel */
 .left-panel {
@@ -150,6 +151,14 @@ input[type="color"] { width: 30px; height: 26px; padding: 1px; cursor: pointer; 
 .attendee-item.assigned::before { content: "✓"; color: var(--success); font-size: 10px; margin-right: 2px; }
 .attendee-item.disabled { color: var(--text-muted); text-decoration: line-through; opacity: 0.5; }
 .attendee-item.dragging { opacity: 0.4; }
+.attendee-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-plus-one {
+  display: none; padding: 0 5px; font-size: 10px; font-weight: 700;
+  background: rgba(226, 179, 64, 0.2); color: var(--accent); border: 1px solid var(--accent);
+  border-radius: 4px; cursor: pointer; line-height: 18px; flex-shrink: 0;
+}
+.att-plus-one:hover { background: rgba(226, 179, 64, 0.4); }
+.attendee-item:hover .att-plus-one { display: block; }
 
 /* Panel buttons */
 .panel-actions {
@@ -285,7 +294,7 @@ input[type="color"] { width: 30px; height: 26px; padding: 1px; cursor: pointer; 
   border-radius: var(--radius-sm); transition: background 0.1s;
 }
 .seat-name:hover { background: rgba(255,255,255,0.05); }
-.seat-name.filled { color: var(--success); }
+.seat-name.filled { color: var(--success); cursor: grab; }
 .seat-name.empty { color: var(--text-muted); font-style: italic; }
 .seat-actions { display: flex; gap: 2px; }
 .seat-action {
